@@ -6,11 +6,16 @@ import (
 	"fmt"
 	"strings"
 	"reflect"
+	"sync"
 )
+var mutex=&sync.Mutex{}
 var store=new(database)
+
+var allcache=make(map[net.Conn]*transactionCache)
 func main(){
 	store.kv=make(map[string]string)
-    l, err:=net.Listen("tcp", "localhost:8888")
+	
+    l, err:=net.Listen("tcp", "0.0.0.0:8888")
 		if err!=nil {
 			
 		}
@@ -75,12 +80,13 @@ func (db *database) DEL(key string, _... string) {
 func parseAndHandleRequest(conn net.Conn){
 	//conn.SetReadTimeout(5e9)
 	var interactionIsRegular=true
-	cache:=new(transactionCache)
+	
+	
 	scannedCommand:=make(chan command)
 	scanner:=bufio.NewScanner(conn)
 	go scanInput(*scanner,scannedCommand)
 
-	go handleCommand(&interactionIsRegular,scannedCommand,conn,cache)
+	go handleCommand(&interactionIsRegular,scannedCommand,conn)
     
 }
 
@@ -93,33 +99,50 @@ func Invoke(any interface{}, name string, args... interface{})[]reflect.Value {
 }
 
 
-func handleRegularInteraction(cmd command,interactionIsRegular *bool,cache *transactionCache){
+func handleRegularInteraction(cmd command,interactionIsRegular *bool,conn net.Conn){
 	fmt.Printf("handling regular interaction: %s\n",cmd[0])
 	if cmd[0]!="QUIT"&&cmd[0]!="BEGIN" {
+		mutex.Lock()
 		result:=Invoke(store,cmd[0],cmd[1],cmd[2])
 		
+		mutex.Unlock()
 		fmt.Printf("result is %s\n",result)
 	}
 	if cmd[0]=="BEGIN" {
 		*interactionIsRegular=false
 		
-		view:=*store
-		cache.view=&view
+		mutex.Lock()
+		cache:=new(transactionCache)
+		view:=new(database)
+		kv:=make(map[string]string)
+		
+		for k,v:=range store.kv{
+			kv[k]=v
+		}
+		view.kv=kv
+		cache.view=view
+		allcache[conn]=cache
+
+		mutex.Unlock()
+		
 	} 
 }
 
-func handleTransactionalInteraction(cmd command, interactionIsRegular *bool,cache *transactionCache){
+func handleTransactionalInteraction(cmd command, interactionIsRegular *bool,conn net.Conn){
 	fmt.Printf("handling transactional interaction: %s\n",cmd[0])
 	if cmd[0]!="QUIT"&&cmd[0]!="COMMIT" {
-		result:=Invoke(cache,cmd[0],cmd[1],cmd[2])
-	
+		result:=Invoke(allcache[conn],cmd[0],cmd[1],cmd[2])
+		allcache[conn].commands=append(allcache[conn].commands,cmd)
 		fmt.Printf("result is %s\n",result)
 	}
 	if cmd[0]=="COMMIT" {
-		*interactionIsRegular=true
-		for _,cmd :=range cache.commands {
+		mutex.Lock()
+		for _,cmd :=range allcache[conn].commands {
 			Invoke(store,cmd[0],cmd[1],cmd[2])
+			fmt.Printf("commiting %s\n",cmd[0])
 		}
+		mutex.Unlock()
+		*interactionIsRegular=true
 	} 
 
 }
@@ -136,7 +159,7 @@ func scanInput(scanner bufio.Scanner,scannedCommand chan<-command){
 	}
 }
 
-func handleCommand(interactionIsRegular *bool,scannedCommand chan command, conn net.Conn, cache *transactionCache){
+func handleCommand(interactionIsRegular *bool,scannedCommand chan command, conn net.Conn){
 	for {
 		select {
 		case cmd:=<-scannedCommand:
@@ -144,10 +167,10 @@ func handleCommand(interactionIsRegular *bool,scannedCommand chan command, conn 
 			switch *interactionIsRegular{
 
 	
-				case true: handleRegularInteraction(cmd,interactionIsRegular,cache)
+				case true: handleRegularInteraction(cmd,interactionIsRegular,conn)
 		
 		
-				case false: handleTransactionalInteraction(cmd,interactionIsRegular,cache)
+				case false: handleTransactionalInteraction(cmd,interactionIsRegular,conn)
 				}
 			
 		default:
